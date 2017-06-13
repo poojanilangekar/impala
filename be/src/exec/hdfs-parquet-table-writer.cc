@@ -102,7 +102,12 @@ class HdfsParquetTableWriter::BaseColumnWriter {
       def_levels_(nullptr),
       values_buffer_len_(DEFAULT_DATA_PAGE_SIZE),
       page_stats_base_(nullptr),
-      row_group_stats_base_(nullptr) {
+      row_group_stats_base_(nullptr),
+      page_locations_(0),
+      valid_values_(0),
+      min_values_(0),
+      max_values_(0),
+      null_count_(0) {
     Codec::CreateCompressor(nullptr, false, codec, &compressor_);
 
     def_levels_ = parent_->state_->obj_pool()->Add(
@@ -278,6 +283,15 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   // Pointers to statistics, created, owned, and set by the derived class.
   ColumnStatsBase* page_stats_base_;
   ColumnStatsBase* row_group_stats_base_;
+
+  // PageLocations to be stored in the OffsetIndex
+  std::vector<parquet::PageLocation> page_locations_;
+
+  // Statistics to be stored in the ColumnIndex
+  std::vector<bool> valid_values_;
+  std::vector<std::string> min_values_;
+  std::vector<std::string> max_values_;
+  std::vector<int64_t> null_count_;
 };
 
 // Per type column writer.
@@ -590,14 +604,27 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
   }
 
   *first_data_page = *file_pos;
+  int64_t current_row_group_index = 0;
+  page_locations_.resize(num_data_pages_);
+
   // Write data pages
   for (int i = 0; i < num_data_pages_; ++i) {
     DataPage& page = pages_[i];
+    parquet::PageLocation location;
 
     if (page.header.data_page_header.num_values == 0) {
       // Skip empty pages
+      location.offset = -1;
+      location.compressed_page_size = -1;
+      location.first_row_index = -1;
+      page_locations_[i] = location;
       continue;
     }
+
+    location.offset = *file_pos;
+    location.compressed_page_size = page.header.compressed_page_size;
+    location.first_row_index = current_row_group_index;
+    page_locations_[i] = location;
 
     // Write data page header
     uint8_t* buffer = nullptr;
@@ -610,6 +637,7 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     // Write the page data
     RETURN_IF_ERROR(parent_->Write(page.data, page.header.compressed_page_size));
     *file_pos += page.header.compressed_page_size;
+    current_row_group_index += page.header.data_page_header.num_values;
   }
   return Status::OK();
 }
@@ -683,8 +711,29 @@ void HdfsParquetTableWriter::BaseColumnWriter::FinalizeCurrentPage() {
   // Build page statistics and add them to the header.
   DCHECK(page_stats_base_ != nullptr);
   if (page_stats_base_->BytesNeeded() <= MAX_COLUMN_STATS_SIZE) {
-    page_stats_base_->EncodeToThrift(&header.data_page_header.statistics);
-    header.data_page_header.__isset.statistics = true;
+    parquet::Statistics page_stats;
+    page_stats_base_->EncodeToThrift(&page_stats);
+
+    // If parquet_write_index is set, store the statistics to be written to the
+    // column_index. Otherwise, set the statistics in the data_page_header
+    if (parent_->state_->query_options().parquet_write_index) {
+      // If pages_stats contains the min and max values, update them to min_values_ and
+      // max_values_ and mark the values as valid. In case min and max values are not
+      // set, push empty strings to maintain the consistency of the index and mark the
+      // values as invalid. Always push the null_count.
+      if ((page_stats.__isset.min_value) && (page_stats.__isset.max_value)) {
+        min_values_.push_back(page_stats.min_value);
+        max_values_.push_back(page_stats.max_value);
+        valid_values_.push_back(true);
+      } else {
+        min_values_.push_back(std::string(""));
+        max_values_.push_back(std::string(""));
+        valid_values_.push_back(false);
+      }
+      null_count_.push_back(page_stats.null_count);
+    } else {
+      header.data_page_header.__set_statistics(page_stats);
+    }
   }
 
   // Update row group statistics from page statistics.
@@ -1011,6 +1060,7 @@ Status HdfsParquetTableWriter::Finalize() {
   file_metadata_.__isset.column_orders = true;
 
   RETURN_IF_ERROR(FlushCurrentRowGroup());
+  RETURN_IF_ERROR(WritePageIndex());
   RETURN_IF_ERROR(WriteFileFooter());
   stats_.__set_parquet_stats(parquet_insert_stats_);
   COUNTER_ADD(parent_->rows_inserted_counter(), row_count_);
@@ -1116,11 +1166,60 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
     sorting_column.column_idx = col_idx;
     sorting_column.descending = false;
     sorting_column.nulls_first = false;
+    // This column is sorted, there is no need to store the max_values in the index.
+    if (state_->query_options().parquet_write_index) {
+      columns_[col_idx]->max_values_.resize(0);
+    }
   }
   current_row_group_->__isset.sorting_columns =
       !current_row_group_->sorting_columns.empty();
 
   current_row_group_ = nullptr;
+  return Status::OK();
+}
+
+Status HdfsParquetTableWriter::WritePageIndex() {
+  // If the file contains more than one row_group, don't write the index.
+  if (file_metadata_.row_groups.size() != 1) return Status::OK();
+
+  // Write index only if the parquet_write_index file option is set.
+  if (state_->query_options().parquet_write_index) {
+    parquet::RowGroup* row_group = &(file_metadata_.row_groups[0]);
+    uint8_t* buffer;
+    uint32_t len;
+    for (int i = 0; i < columns_.size(); i++) {
+      // Write out the offset_index for column i.
+      parquet::OffsetIndex offset_index;
+      buffer = nullptr;
+      len = 0;
+      offset_index.__set_page_locations(columns_[i]->page_locations_);
+      RETURN_IF_ERROR(thrift_serializer_->Serialize(&offset_index, &len, &buffer));
+      RETURN_IF_ERROR(Write(buffer, len));
+      // Update the offset_index_offset and offset_index_length of the ColumnChunk
+      row_group->columns[i].__set_offset_index_offset(file_pos_);
+      row_group->columns[i].__set_offset_index_length(len);
+      file_pos_ += len;
+
+      // Write out the column_index for column i.
+      parquet::ColumnIndex column_index;
+      buffer = nullptr;
+      len = 0;
+      column_index.__set_valid_values(columns_[i]->valid_values_);
+      column_index.__set_min_values(columns_[i]->min_values_);
+      // max_values are written out only for non sorting columns.
+      if (columns_[i]->max_values_.size() > 0) {
+        column_index.__set_max_values(columns_[i]->max_values_);
+      }
+      column_index.__set_null_count(columns_[i]->null_count_);
+      RETURN_IF_ERROR(thrift_serializer_->Serialize(&column_index, &len, &buffer));
+      RETURN_IF_ERROR(Write(buffer, len));
+      // Update the column_index_offset and column_index_length of the ColumnChunk
+      row_group->columns[i].__set_column_index_offset(file_pos_);
+      row_group->columns[i].__set_column_index_length(len);
+      file_pos_ += len;
+    }
+  }
+
   return Status::OK();
 }
 

@@ -493,6 +493,11 @@ Status impala::SetQueryOption(const string& key, const string& value,
         }
         break;
       }
+      case TImpalaQueryOptions::PARQUET_WRITE_INDEX: {
+        query_options->__set_parquet_write_index(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.

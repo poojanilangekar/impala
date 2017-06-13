@@ -251,6 +251,10 @@ struct TQueryOptions {
   // cardinality, e.g., because of missing table statistics.
   56: optional TJoinDistributionMode default_join_distribution_mode =
     TJoinDistributionMode.BROADCAST
+
+  // Indicates whether to populate the per page column indexes while writing tables into
+  // Parquet files.
+  57: optional bool parquet_write_index = false
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2

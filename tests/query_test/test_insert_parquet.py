@@ -35,6 +35,7 @@ from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
 from tests.util.get_parquet_metadata import get_parquet_metadata, decode_stats_value
+from tests.util.get_parquet_index import get_column_index, get_offset_index
 
 # TODO: Add Gzip back.  IMPALA-424
 PARQUET_CODECS = ['none', 'snappy']
@@ -612,3 +613,165 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
     self._ctas_table_and_verify_stats(vector, unique_database,
       "functional_parquet.zipcode_incomes", expected_min_max_values)
+
+class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestHdfsParquetTableIndexWriter, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('table_format').file_format == 'parquet')
+
+  def _get_row_group_from_file(self, parquet_file):
+    """Returns the schema, stats, offset_index and column_index for each column in the
+    first row group in file 'parquet_file'. Fails if the file contains multiple row
+    groups."""
+    file_meta_data = get_parquet_metadata(parquet_file)
+    assert len(file_meta_data.row_groups) == 1
+    # We only support flat schemas, the additional element is the root element.
+    schemas = file_meta_data.schema[1:]
+    row_group = file_meta_data.row_groups[0]
+    row_group_index = []
+    for column, schema in zip(row_group.columns, schemas):
+      offset_index_offset = column.offset_index_offset
+      offset_index_length = column.offset_index_length
+      offset_index = None
+      if (offset_index_offset is not None) and (offset_index_length is not None):
+        offset_index = get_offset_index(parquet_file, offset_index_offset,
+        offset_index_length)
+
+      column_index_offset = column.column_index_offset
+      column_index_length = column.column_index_length
+      column_index = None
+      if (column_index_offset is not None) and (column_index_length is not None):
+        column_index = get_column_index(parquet_file, column_index_offset,
+          column_index_length)
+      column_meta_data = column.meta_data
+      stats = None
+      if column_meta_data is not None:
+        stats = column_meta_data.statistics
+
+      row_group_index.append((schema, stats, offset_index, column_index))
+    return row_group_index
+
+  def _get_row_group_from_hdfs_folder(self, hdfs_path):
+    """Returns a list of tuples (containing the schema, stats, offset_index and
+    column_index) for a row group in all parquet files in 'hdfs_path'. The result
+    is a two-dimensional list, containing row groups and filename, for each file
+    in the hdfs_path."""
+    row_group_indexes = []
+
+    try:
+      tmp_dir = make_tmp_dir()
+      check_call(['hdfs', 'dfs', '-get', hdfs_path, tmp_dir])
+      for root, subdirs, files in os.walk(tmp_dir):
+        for f in files:
+          parquet_file = os.path.join(root, str(f))
+          row_group_indexes.append(self._get_row_group_from_file(parquet_file))
+    finally:
+      rmtree(tmp_dir)
+
+    return row_group_indexes
+
+  def _validate_parquet_index(self, hdfs_path, sorting_column, skip_col_idxs = None):
+    """Validates that 'hdfs_path' contains exactly one parquet file and that the rowgroup
+    index in that file is in the valid format. Columns indexed by 'skip_col_idx'
+    are excluded from the verification of the expected values."""
+    skip_col_idxs = skip_col_idxs or []
+
+    row_group_indexes = self._get_row_group_from_hdfs_folder(hdfs_path)
+    for columns in row_group_indexes:
+      for (schema, stats, offset_index, column_index) in columns:
+        index_size = len(offset_index.page_locations)
+        assert index_size > 0
+        previous_loc = offset_index.page_locations[0]
+        for current_loc in offset_index.page_locations[1:]:
+          assert previous_loc.offset < current_loc.offset
+          assert previous_loc.first_row_index < current_loc.first_row_index
+          previous_loc = current_loc
+        valid_values = column_index.valid_values
+
+        assert valid_values is not None
+        assert len(valid_values) == index_size
+
+        null_counts = column_index.null_count
+        assert len(null_counts) == index_size
+        for valid, null_count in zip(valid_values, null_counts):
+          # Not accurate. Does not make sure null_count is equal to number of rows.
+          # Only makes sure null_count is greater than zero when min/max values are
+          # invalid.
+          assert (valid is True) or (null_count > 0)
+
+        min_values = column_index.min_values
+        assert len(min_values) == index_size
+        min_value = stats.min_value
+        if min_value is not None:
+          min_value = decode_stats_value(schema, min_value)
+        for valid, value in zip(valid_values, min_values):
+          if valid:
+            assert decode_stats_value(schema, value) >= min_value
+
+        max_values = column_index.max_values
+        #Ensure that max_values don't get indexed for a sorting column
+        assert (max_values is not None) or (schema.name == sorting_column)
+        if max_values is None:
+          #This is a sorting column. Ensure min_values are sorted
+          previous_valid = valid_values[0]
+          previous_value = decode_stats_value(schema, min_values[0])
+          for valid, value in zip(valid_values[1:], min_values[1:]):
+            if valid and previous_valid:
+              value = decode_stats_value(schema, value)
+              assert value >= previous_value
+              previous_valid = valid
+              previous_value = value
+            else:
+              assert len(max_values) == index_size
+              max_value = stats.max_value
+              if max_value is not None:
+                max_value = decode_stats_value(schema, max_value)
+                for valid, value in zip(valid_values, max_values):
+                  if valid:
+                    assert decode_stats_value(schema, value) <= max_value
+
+  def _ctas_table_and_verify_index(self, vector, unique_database, source_table,
+                                   sorting_column = None):
+    """Copies 'source_table' into a parquet table and makes sure that the index
+    in the resulting parquet file is valid."""
+    table_name = "test_hdfs_parquet_table_writer"
+    qualified_table_name = "{0}.{1}".format(unique_database, table_name)
+    hdfs_path = get_fs_path('/test-warehouse/{0}.db/{1}/'.format(unique_database,
+                                                                 table_name))
+    # Setting num_nodes = 1 ensures that the query is executed on the coordinator,
+    # resulting in a single parquet file being written.
+    self.execute_query("drop table if exists {0}".format(qualified_table_name))
+    self.execute_query("set parquet_write_index = 1")
+    if sorting_column is None:
+      query = ("create table {0} stored as parquet as select * from {1}").format(
+        qualified_table_name, source_table)
+    else:
+      query = ("create table {0} sort by({1}) stored as parquet as select * from {2}"
+        ).format(qualified_table_name, sorting_column, source_table)
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.execute_query(query, vector.get_value('exec_option'))
+    self._validate_parquet_index(hdfs_path, sorting_column)
+
+  def test_write_index_alltypes(self, vector, unique_database):
+    """Test that writing a parquet file populates the rowgroup indexes with the correct
+    values."""
+    self._ctas_table_and_verify_index(vector, unique_database, "functional.alltypes")
+  def test_write_index_null(self, vector, unique_database):
+    """Test that we don't write min/max values in the index for null columns.
+    Ensure null_count is set for columns with null values."""
+    self._ctas_table_and_verify_index(vector, unique_database, "functional.nulltable")
+  def test_write_index_multi_page(self, vector, unique_database):
+    """Test that when a ColumnChunk is written across multiple pages, the index is
+    valid."""
+    self._ctas_table_and_verify_index(vector, unique_database, "tpch.customer")
+  def test_write_index_sorting_column(self, vector, unique_database):
+    """Test that when the schema has a sorting column, the index is valid."""
+    self._ctas_table_and_verify_index(vector, unique_database,
+            "functional_parquet.zipcode_incomes", "id")

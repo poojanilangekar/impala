@@ -274,7 +274,11 @@ enum TImpalaQueryOptions {
 
   // Join distribution mode that is used when the join inputs have an unknown
   // cardinality, e.g., because of missing table statistics.
-  DEFAULT_JOIN_DISTRIBUTION_MODE
+  DEFAULT_JOIN_DISTRIBUTION_MODE,
+
+  // Indicates whether to populate the per page column indexes while writing tables into
+  // Parquet files.
+  PARQUET_WRITE_INDEX
 }
 
 // The summary of a DML statement.

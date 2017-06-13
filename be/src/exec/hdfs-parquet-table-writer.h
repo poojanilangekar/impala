@@ -134,6 +134,11 @@ class HdfsParquetTableWriter : public HdfsTableWriter {
   /// new row group.  current_row_group_ will be flushed.
   Status AddRowGroup();
 
+  /// Write the column index and offset index of each page in the file.
+  /// TODO: Currently, the indexed would be written if the file contains only one
+  /// row group. Extend it to handle multiple row groups.
+  Status WritePageIndex();
+
   /// Thrift serializer utility object.  Reusing this object allows for
   /// fewer memory allocations.
   boost::scoped_ptr<ThriftSerializer> thrift_serializer_;
