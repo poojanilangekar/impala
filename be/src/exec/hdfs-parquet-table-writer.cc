@@ -107,7 +107,9 @@ class HdfsParquetTableWriter::BaseColumnWriter {
       valid_values_(0),
       min_values_(0),
       max_values_(0),
-      null_count_(0) {
+      null_count_(0),
+      is_ordered_(true),
+      first_value_(true) {
     Codec::CreateCompressor(nullptr, false, codec, &compressor_);
 
     def_levels_ = parent_->state_->obj_pool()->Add(
@@ -169,6 +171,8 @@ class HdfsParquetTableWriter::BaseColumnWriter {
     column_encodings_.insert(Encoding::RLE);
     column_encodings_.insert(Encoding::BIT_PACKED);
   }
+
+  bool IsOrdered() { return is_ordered_; }
 
   // Close this writer. This is only called after Flush() and no more rows will
   // be added.
@@ -292,6 +296,12 @@ class HdfsParquetTableWriter::BaseColumnWriter {
   std::vector<std::string> min_values_;
   std::vector<std::string> max_values_;
   std::vector<int64_t> null_count_;
+
+  // Stores whether or not the values in this ColumnChunk are ordered (ascending order).
+  bool is_ordered_;
+
+  // Determines if the current value being processed is the first in the ColumnReader.
+  bool first_value_;
 };
 
 // Per type column writer.
@@ -326,6 +336,15 @@ class HdfsParquetTableWriter::ColumnWriter :
 
  protected:
   virtual bool ProcessValue(void* value, int64_t* bytes_needed) {
+    T* v = CastValue(value);
+    // Check if the new value maintains the ordering in the column.
+    if (is_ordered_) {
+      if (first_value_) {
+        prev_value_ = *v;
+        first_value_ = false;
+      } else if (prev_value_ > *v) is_ordered_ = false;
+      else prev_value_ = *v;
+    }
     if (current_encoding_ == Encoding::PLAIN_DICTIONARY) {
       if (UNLIKELY(num_values_since_dict_size_check_ >=
                    DICTIONARY_DATA_PAGE_SIZE_CHECK_PERIOD)) {
@@ -333,7 +352,7 @@ class HdfsParquetTableWriter::ColumnWriter :
         if (dict_encoder_->EstimatedDataEncodedSize() >= page_size_) return false;
       }
       ++num_values_since_dict_size_check_;
-      *bytes_needed = dict_encoder_->Put(*CastValue(value));
+      *bytes_needed = dict_encoder_->Put(*v);
       // If the dictionary contains the maximum number of values, switch to plain
       // encoding.  The current dictionary encoded page is written out.
       if (UNLIKELY(*bytes_needed < 0)) {
@@ -343,7 +362,6 @@ class HdfsParquetTableWriter::ColumnWriter :
       }
       parent_->file_size_estimate_ += *bytes_needed;
     } else if (current_encoding_ == Encoding::PLAIN) {
-      T* v = CastValue(value);
       *bytes_needed = plain_encoded_value_size_ < 0 ?
           ParquetPlainEncoder::ByteSize<T>(*v) :
           plain_encoded_value_size_;
@@ -395,6 +413,9 @@ class HdfsParquetTableWriter::ColumnWriter :
   inline T* CastValue(void* value) {
     return reinterpret_cast<T*>(value);
   }
+
+  // Tracks the previous value processed.
+  T prev_value_;
 };
 
 template<>
@@ -434,6 +455,15 @@ class HdfsParquetTableWriter::BoolColumnWriter :
     bool v = *reinterpret_cast<bool*>(value);
     if (!bool_values_->PutValue(v, 1)) return false;
     page_stats_.Update(v);
+    // Check if the new value maintains the ordering in the column.
+    if (is_ordered_) {
+      if (first_value_) {
+        prev_value_ = v;
+        first_value_ = false;
+      }
+      if (prev_value_ > v) is_ordered_ = false;
+      else prev_value_ = v;
+    }
     return true;
   }
 
@@ -457,6 +487,9 @@ class HdfsParquetTableWriter::BoolColumnWriter :
 
   // Tracks statistics per row group. This gets reset when starting a new file.
   ColumnStats<bool> row_group_stats_;
+
+  // Tracks the previous value processed.
+  bool prev_value_;
 };
 
 }
@@ -1155,7 +1188,8 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
         thrift_serializer_->Serialize(&current_row_group_->columns[i], &len, &buffer));
     RETURN_IF_ERROR(Write(buffer, len));
     file_pos_ += len;
-
+    // Check if the column is ordered, don't store max_values for ordered columns.
+    if (col_writer->IsOrdered()) col_writer->max_values_.resize(0);
     col_writer->Reset();
   }
 
@@ -1166,10 +1200,6 @@ Status HdfsParquetTableWriter::FlushCurrentRowGroup() {
     sorting_column.column_idx = col_idx;
     sorting_column.descending = false;
     sorting_column.nulls_first = false;
-    // This column is sorted, there is no need to store the max_values in the index.
-    if (state_->query_options().parquet_write_index) {
-      columns_[col_idx]->max_values_.resize(0);
-    }
   }
   current_row_group_->__isset.sorting_columns =
       !current_row_group_->sorting_columns.empty();
@@ -1185,25 +1215,17 @@ Status HdfsParquetTableWriter::WritePageIndex() {
   // Write index only if the parquet_write_index file option is set.
   if (state_->query_options().parquet_write_index) {
     parquet::RowGroup* row_group = &(file_metadata_.row_groups[0]);
-    uint8_t* buffer;
-    uint32_t len;
+    std::vector<parquet::OffsetIndex> offset_indexes(columns_.size());
+    uint8_t* buffer = nullptr;
+    uint32_t len = 0;
     for (int i = 0; i < columns_.size(); i++) {
-      // Write out the offset_index for column i.
+
       parquet::OffsetIndex offset_index;
-      buffer = nullptr;
-      len = 0;
       offset_index.__set_page_locations(columns_[i]->page_locations_);
-      RETURN_IF_ERROR(thrift_serializer_->Serialize(&offset_index, &len, &buffer));
-      RETURN_IF_ERROR(Write(buffer, len));
-      // Update the offset_index_offset and offset_index_length of the ColumnChunk
-      row_group->columns[i].__set_offset_index_offset(file_pos_);
-      row_group->columns[i].__set_offset_index_length(len);
-      file_pos_ += len;
+      offset_indexes[i] = offset_index;
 
       // Write out the column_index for column i.
       parquet::ColumnIndex column_index;
-      buffer = nullptr;
-      len = 0;
       column_index.__set_valid_values(columns_[i]->valid_values_);
       column_index.__set_min_values(columns_[i]->min_values_);
       // max_values are written out only for non sorting columns.
@@ -1217,7 +1239,20 @@ Status HdfsParquetTableWriter::WritePageIndex() {
       row_group->columns[i].__set_column_index_offset(file_pos_);
       row_group->columns[i].__set_column_index_length(len);
       file_pos_ += len;
+
+      buffer = nullptr;
+      len = 0;
     }
+
+    // Write out the offset_indexes for the row_group.
+    parquet::RowGroupOffsetIndex row_group_offset_index;
+    row_group_offset_index.__set_offset_indexes(offset_indexes);
+    RETURN_IF_ERROR(thrift_serializer_->Serialize(&row_group_offset_index, &len, &buffer));
+    RETURN_IF_ERROR(Write(buffer, len));
+    // Update the offset_index_offset and offset_index_length for the RowGroup
+    row_group->__set_offset_index_offset(file_pos_);
+    row_group->__set_offset_index_length(len);
+    file_pos_ += len;
   }
 
   return Status::OK();

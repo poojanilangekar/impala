@@ -35,7 +35,7 @@ from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.util.filesystem_utils import get_fs_path
 from tests.util.get_parquet_metadata import get_parquet_metadata, decode_stats_value
-from tests.util.get_parquet_index import get_column_index, get_offset_index
+from tests.util.get_parquet_index import get_column_index, get_row_group_offset_index
 
 # TODO: Add Gzip back.  IMPALA-424
 PARQUET_CODECS = ['none', 'snappy']
@@ -627,7 +627,7 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
         lambda v: v.get_value('table_format').file_format == 'parquet')
 
   def _get_row_group_from_file(self, parquet_file):
-    """Returns the schema, stats, offset_index and column_index for each column in the
+    """Returns the schema, stats and column_index for each column and offset_index of the
     first row group in file 'parquet_file'. Fails if the file contains multiple row
     groups."""
     file_meta_data = get_parquet_metadata(parquet_file)
@@ -637,13 +637,6 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     row_group = file_meta_data.row_groups[0]
     row_group_index = []
     for column, schema in zip(row_group.columns, schemas):
-      offset_index_offset = column.offset_index_offset
-      offset_index_length = column.offset_index_length
-      offset_index = None
-      if (offset_index_offset is not None) and (offset_index_length is not None):
-        offset_index = get_offset_index(parquet_file, offset_index_offset,
-        offset_index_length)
-
       column_index_offset = column.column_index_offset
       column_index_length = column.column_index_length
       column_index = None
@@ -655,8 +648,16 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
       if column_meta_data is not None:
         stats = column_meta_data.statistics
 
-      row_group_index.append((schema, stats, offset_index, column_index))
-    return row_group_index
+      row_group_index.append((schema, stats, column_index))
+
+    offset_index_offset = row_group.offset_index_offset
+    offset_index_length = row_group.offset_index_length
+    row_group_offset_index = None
+    if (offset_index_offset is not None) and (offset_index_length is not None):
+      row_group_offset_index = get_row_group_offset_index(parquet_file,
+        offset_index_offset, offset_index_length)
+
+    return (row_group_index, row_group_offset_index)
 
   def _get_row_group_from_hdfs_folder(self, hdfs_path):
     """Returns a list of tuples (containing the schema, stats, offset_index and
@@ -664,6 +665,7 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     is a two-dimensional list, containing row groups and filename, for each file
     in the hdfs_path."""
     row_group_indexes = []
+    row_group_offset_indexes = []
 
     try:
       tmp_dir = make_tmp_dir()
@@ -671,11 +673,14 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
       for root, subdirs, files in os.walk(tmp_dir):
         for f in files:
           parquet_file = os.path.join(root, str(f))
-          row_group_indexes.append(self._get_row_group_from_file(parquet_file))
+          (row_group_index, row_group_offset_index) = self._get_row_group_from_file(
+            parquet_file)
+          row_group_indexes.append(row_group_index)
+          row_group_offset_indexes.append(row_group_offset_index)
     finally:
       rmtree(tmp_dir)
 
-    return row_group_indexes
+    return row_group_indexes, row_group_offset_indexes
 
   def _validate_parquet_index(self, hdfs_path, sorting_column, skip_col_idxs = None):
     """Validates that 'hdfs_path' contains exactly one parquet file and that the rowgroup
@@ -683,9 +688,11 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     are excluded from the verification of the expected values."""
     skip_col_idxs = skip_col_idxs or []
 
-    row_group_indexes = self._get_row_group_from_hdfs_folder(hdfs_path)
-    for columns in row_group_indexes:
-      for (schema, stats, offset_index, column_index) in columns:
+    row_group_indexes, row_group_offset_indexes = self._get_row_group_from_hdfs_folder(
+      hdfs_path)
+    for (columns, row_group_indexes) in zip(row_group_indexes, row_group_offset_indexes):
+      for ((schema, stats, column_index), offset_index) in zip(columns,
+        row_group_indexes.offset_indexes):
         index_size = len(offset_index.page_locations)
         assert index_size > 0
         previous_loc = offset_index.page_locations[0]
@@ -717,10 +724,13 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
 
         max_values = column_index.max_values
         #Ensure that max_values don't get indexed for a sorting column
-        assert (max_values is not None) or (schema.name == sorting_column)
+        if schema.name == sorting_column:
+          assert max_values is None
         if max_values is None:
           #This is a sorting column. Ensure min_values are sorted
           previous_valid = valid_values[0]
+          if previous_valid == False:
+            continue
           previous_value = decode_stats_value(schema, min_values[0])
           for valid, value in zip(valid_values[1:], min_values[1:]):
             if valid and previous_valid:

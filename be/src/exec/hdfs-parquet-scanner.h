@@ -23,6 +23,7 @@
 #include "exec/hdfs-scanner.h"
 #include "exec/parquet-common.h"
 #include "exec/parquet-scratch-tuple-batch.h"
+#include "exec/parquet-index-filter.h"
 #include "exec/parquet-metadata-utils.h"
 #include "runtime/scoped-buffer.h"
 #include "util/runtime-profile-counters.h"
@@ -486,6 +487,13 @@ class HdfsParquetScanner : public HdfsScanner {
   /// skipped, 'false' otherwise.
   Status EvaluateStatsConjuncts(const parquet::FileMetaData& file_metadata,
       const parquet::RowGroup& row_group, bool* skip_row_group);
+
+  /// Initializes a ParquetIndexFilter and evaluates the min/max conjuncts on the indexes
+  /// of the columns if present. If one or more pages could be skipped, sets 'skip_pages'
+  /// to true and populates the 'valid_pages' for each column  in the RowGroup, otherwise
+  /// sets 'skip_pages' to false.
+  Status EvaluateParquetIndex(const parquet::RowGroup& row_group, bool* skip_pages,
+      vector<FilteredPageInfos>& valid_pages);
 
   /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
   /// row batches. Will update 'filter_stats_'.

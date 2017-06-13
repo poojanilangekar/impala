@@ -73,6 +73,10 @@ class ColumnStatsBase {
       const ColumnType& col_type, const parquet::ColumnOrder* col_order,
       StatsField stats_field, void* slot);
 
+  /// Read stats value from the string.
+  static bool ReadFromString(const ColumnType& col_type, const string* stat_value,
+      void* slot);
+
   /// Merges this statistics object with values from 'other'. If other has not been
   /// initialized, then this object will not be changed.
   virtual void Merge(const ColumnStatsBase& other) = 0;

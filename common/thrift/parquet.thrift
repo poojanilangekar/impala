@@ -552,17 +552,11 @@ struct ColumnChunk {
    **/
   3: optional ColumnMetaData meta_data
 
-  /** File offset of this column's OffsetIndex **/
-  4: optional i64 offset_index_offset
-
-  /** Size of this column's OffsetIndex, in bytes **/
-  5: optional i32 offset_index_length
-
   /** File offset of this column's ColumnIndex **/
-  6: optional i64 column_index_offset
+  4: optional i64 column_index_offset
 
   /** Size of this column's ColumnIndex, in bytes **/
-  7: optional i32 column_index_length
+  5: optional i32 column_index_length
 }
 
 struct RowGroup {
@@ -581,6 +575,12 @@ struct RowGroup {
    * The sorting columns can be a subset of all the columns.
    */
   4: optional list<SortingColumn> sorting_columns
+
+  /** File offset of this RowGroup's RowGroupOffsetIndex **/
+  5: optional i64 offset_index_offset
+
+  /** Size of this RowGroup's RowGroupOffsetIndex, in bytes **/
+  6: optional i32 offset_index_length
 }
 
 /** Empty struct to signal the order defined by the physical or logical type */
@@ -614,6 +614,11 @@ struct PageLocation {
 struct OffsetIndex {
 /** PageLocations, ordered by increasing PageLocation.offset **/
   1: required list<PageLocation> page_locations
+}
+
+struct RowGroupOffsetIndex {
+/** OffsetIndexes corresponding to each column in the RowGroup **/
+  1: required list<OffsetIndex> offset_indexes
 }
 
 /**

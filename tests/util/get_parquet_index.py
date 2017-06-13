@@ -20,7 +20,7 @@ import struct
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from parquet.ttypes import FileMetaData, ColumnIndex, OffsetIndex, Type
+from parquet.ttypes import FileMetaData, ColumnIndex, RowGroupOffsetIndex, Type
 from thrift.protocol import TCompactProtocol
 from thrift.transport import TTransport
 
@@ -40,18 +40,18 @@ def get_column_index(filename, file_pos, length):
     column_index.read(protocol)
     return column_index
 
-def get_offset_index(filename, file_pos, length):
+def get_row_group_offset_index(filename, file_pos, length):
   with open(filename) as f:
 
     #Seek to the offset_index
     f.seek(file_pos)
 
     # Read serialized offset_index
-    serialized_offset_index =  f.read(length)
+    serialized_row_group_offset_index =  f.read(length)
 
     #Deserialize offset_index
-    transport = TTransport.TMemoryBuffer(serialized_offset_index)
+    transport = TTransport.TMemoryBuffer(serialized_row_group_offset_index)
     protocol = TCompactProtocol.TCompactProtocol(transport)
-    offset_index = OffsetIndex()
-    offset_index.read(protocol)
-    return offset_index
+    row_group_offset_index = RowGroupOffsetIndex()
+    row_group_offset_index.read(protocol)
+    return row_group_offset_index

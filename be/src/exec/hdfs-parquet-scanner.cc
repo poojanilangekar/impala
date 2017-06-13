@@ -490,6 +490,63 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
   return Status::OK();
 }
 
+Status HdfsParquetScanner::EvaluateParquetIndex(const parquet::RowGroup& row_group,
+    bool* skip_pages, vector<FilteredPageInfos>& valid_pages) {
+  *skip_pages = false;
+  ScannerContext::Stream* offset_idx_stream = nullptr;
+  std::vector<ScannerContext::Stream*> column_idx_streams(0);
+
+  // If the row_group contains an offset_index_offset and offset_index_length,
+  // initialize a scan_range to read the RowGroupOffsetIndex.
+  if (row_group.__isset.offset_index_offset && row_group.__isset.offset_index_length) {
+    // Ensure the ColumnIndex is set for each ColumnChunk. If the ColumnIndex length and
+    // offset for either Column is not present, it indicates a corrup parquet file.
+    for (int col_idx = 0; col_idx < row_group.columns.size(); ++col_idx) {
+      parquet::ColumnChunk col_chunk = row_group.columns[col_idx];
+      DCHECK(
+          col_chunk.__isset.column_index_offset && col_chunk.__isset.column_index_length);
+    }
+    const DiskIoMgr::ScanRange* split_range =
+        static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
+    bool idx_local = split_range->expected_local();
+    int64_t idx_len = row_group.offset_index_length;
+    int64_t idx_start = row_group.offset_index_offset;
+    HdfsFileDesc* file_desc = scan_node_->GetFileDesc(filename());
+    DiskIoMgr::ScanRange* idx_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
+        filename(), idx_len, idx_start, -1, split_range->disk_id(), idx_local,
+        DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+    offset_idx_stream = context_->AddStream(idx_range);
+    DCHECK(offset_idx_stream != NULL);
+    RETURN_IF_ERROR(scan_node_->runtime_state()->io_mgr()->AddScanRange(
+        scan_node_->reader_context(), idx_range, true));
+
+    column_idx_streams.resize(row_group.columns.size());
+    for (int col_idx = 0; col_idx < row_group.columns.size(); ++col_idx) {
+      parquet::ColumnChunk col_chunk = row_group.columns[col_idx];
+      // If the ColumnChunk contains a column_index_offset and column_index_length,
+      // initialize a scan_range to read the ColumnIndex.
+      int64_t col_idx_len = col_chunk.column_index_length;
+      int64_t col_idx_start = col_chunk.column_index_offset;
+      DiskIoMgr::ScanRange* col_idx_range =
+          scan_node_->AllocateScanRange(metadata_range_->fs(), filename(), col_idx_len,
+              col_idx_start, -1, split_range->disk_id(), idx_local,
+              DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+      ScannerContext::Stream* col_idx_stream = context_->AddStream(col_idx_range);
+      DCHECK(col_idx_range != NULL);
+      column_idx_streams[col_idx] = col_idx_stream;
+      RETURN_IF_ERROR(scan_node_->runtime_state()->io_mgr()->AddScanRange(
+          scan_node_->reader_context(), col_idx_range, true));
+    }
+    Tuple* min_max_tuple = reinterpret_cast<Tuple*>(min_max_tuple_buffer_.buffer());
+
+    ParquetIndexFilter index_filter(row_group, file_metadata_.column_orders, scan_node_,
+        min_max_tuple, min_max_conjunct_evals_, schema_resolver_.get());
+    RETURN_IF_ERROR(index_filter.EvaluateIndexConjuncts(
+        skip_pages, valid_pages, column_idx_streams, offset_idx_stream));
+  }
+  return Status::OK();
+}
+
 Status HdfsParquetScanner::EvaluateStatsConjuncts(
     const parquet::FileMetaData& file_metadata, const parquet::RowGroup& row_group,
     bool* skip_row_group) {
@@ -633,6 +690,10 @@ Status HdfsParquetScanner::NextRowGroup() {
       COUNTER_ADD(num_stats_filtered_row_groups_counter_, 1);
       continue;
     }
+
+    bool skip_pages_on_index;
+    vector<FilteredPageInfos> valid_pages;
+    EvaluateParquetIndex(row_group, &skip_pages_on_index, valid_pages);
 
     // Prepare dictionary filtering columns for first read
     // This must be done before dictionary filtering, because this code initializes

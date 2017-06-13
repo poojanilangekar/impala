@@ -59,6 +59,11 @@ bool ColumnStatsBase::ReadFromThrift(const parquet::ColumnChunk& col_chunk,
   }
   if (stat_value == nullptr) return false;
 
+  return ReadFromString(col_type, stat_value, slot);
+}
+
+bool ColumnStatsBase::ReadFromString(const ColumnType& col_type, const string* stat_value,
+    void* slot) {
   switch (col_type.type) {
     case TYPE_BOOLEAN:
       return ColumnStats<bool>::DecodePlainValue(*stat_value, slot);
