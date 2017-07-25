@@ -270,6 +270,61 @@ class ScannerContext {
     Status ReportInvalidInt();
   };
 
+  /// Concatenates a list of streams by reading them sequentially. It could contain one
+  /// or more streams. This class provides a wrapper around the functions which are
+  /// utilized by BaseScalarColumnReader.
+  ///
+  /// TODO: Currently, the ConcatenatedStreams don't support reads which span across
+  /// multiple streams. Thus the maximum bytes you can read at any given instance is
+  /// dictated by the number of bytes remaining in the current active stream. It is
+  /// the responsibilty of the caller to make sure not to read across scan ranges.
+  class ConcatenatedStreams {
+   public:
+    /// Creates a ConcatenatedStream with the streams list initialized by the parameter.
+    /// The current_idx_ is set to 0.
+    ConcatenatedStreams(vector<Stream*> streams)
+      : streams_(streams), current_idx_(0) {}
+
+    /// Returns the current file offset of the stream pointed to by current_idx_.
+    int64_t file_offset();
+
+    /// If true, all bytes in  all the streams have been returned or we have reached eof
+    /// (the scan range could be longer than the file).
+    bool eosr();
+
+    /// Returns up to requested_len bytes or an error for the first stream in the list
+    /// which has not hit the end of stream. In case every stream has reached eosr, the
+    /// GetBytes function is invoked on the last stream.
+    bool GetBytes(int64_t requested_len, uint8_t** buffer, int64_t* out_len,
+        Status* status, bool peek = false);
+
+    /// Invokes the GetBuffer function on the first stream which is yet to hit eosr. If
+    /// the last stream has hit eosr, then the GetBuffer function is invoked on the last
+    /// stream which would return no bytes.
+    Status GetBuffer(bool peek, uint8_t** buffer, int64_t* out_len);
+
+    /// Skip over the next length bytes in first stream which has not hit eosr.
+    bool SkipBytes(int64_t length, Status* status);
+
+    /// Read length bytes into the first stream which has not hit eosr.
+    bool ReadBytes(int64_t length, uint8_t** buf, Status* status, bool peek = false);
+
+   private:
+    /// A list of streams which are to be utilized by a reader.
+    vector<Stream*> streams_;
+
+    /// Index of the current active stream.
+    int current_idx_;
+
+    /// Advance to the next stream in the list. Returns false when the current index
+    /// is the last stream in the list.
+    bool GetNextStream();
+
+    /// Advances the current index to the first stream which has not hit eosr. If all
+    /// streams have reached eosr, it makes the current index point to the last stream.
+    void SkipStreamIfEosr();
+  };
+
   Stream* GetStream(int idx = 0) {
     DCHECK_GE(idx, 0);
     DCHECK_LT(idx, streams_.size());

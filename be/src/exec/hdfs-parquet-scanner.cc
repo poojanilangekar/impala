@@ -1693,10 +1693,14 @@ Status HdfsParquetScanner::InitColumns(
     col_ranges.push_back(col_range);
 
     // Get the stream that will be used for this column
+    vector<ScannerContext::Stream*> streams;
     ScannerContext::Stream* stream = context_->AddStream(col_range);
     DCHECK(stream != NULL);
-
-    RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, stream));
+    streams.push_back(stream);
+    ScannerContext::ConcatenatedStreams* concatenated_streams =
+        new ScannerContext::ConcatenatedStreams(streams);
+    obj_pool_.Add(concatenated_streams);
+    RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, concatenated_streams));
 
     const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
     if (slot_desc == NULL || !slot_desc->type().IsStringType() ||

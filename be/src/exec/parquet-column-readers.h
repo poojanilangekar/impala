@@ -322,7 +322,8 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   virtual ~BaseScalarColumnReader() { }
 
   /// This is called once for each row group in the file.
-  Status Reset(const parquet::ColumnMetaData* metadata, ScannerContext::Stream* stream) {
+  Status Reset(const parquet::ColumnMetaData* metadata,
+      ScannerContext::ConcatenatedStreams* stream) {
     DCHECK(stream != NULL);
     DCHECK(metadata != NULL);
 
@@ -420,7 +421,7 @@ class BaseScalarColumnReader : public ParquetColumnReader {
 
   const parquet::ColumnMetaData* metadata_;
   boost::scoped_ptr<Codec> decompressor_;
-  ScannerContext::Stream* stream_;
+  ScannerContext::ConcatenatedStreams* stream_;
 
   /// Pool to allocate decompression buffers from.
   boost::scoped_ptr<MemPool> decompressed_data_pool_;

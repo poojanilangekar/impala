@@ -325,3 +325,50 @@ Status ScannerContext::Stream::ReportInvalidRead(int64_t length) {
 Status ScannerContext::Stream::ReportInvalidInt() {
   return Status(TErrorCode::SCANNER_INVALID_INT, filename(), file_offset());
 }
+
+int64_t ScannerContext::ConcatenatedStreams::file_offset() {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->file_offset();
+}
+
+bool ScannerContext::ConcatenatedStreams::eosr() {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->eosr();
+}
+
+Status ScannerContext::ConcatenatedStreams::GetBuffer(
+    bool peek, uint8_t** buffer, int64_t* out_len) {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->GetBuffer(peek, buffer, out_len);
+}
+
+bool ScannerContext::ConcatenatedStreams::GetBytes(int64_t requested_len,
+    uint8_t** buffer, int64_t* out_len, Status* status, bool peek) {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->GetBytes(requested_len, buffer, out_len, status, peek);
+}
+
+bool ScannerContext::ConcatenatedStreams::SkipBytes(int64_t length, Status* status) {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->SkipBytes(length, status);
+}
+
+bool ScannerContext::ConcatenatedStreams::ReadBytes(
+    int64_t length, uint8_t** buf, Status* status, bool peek) {
+  SkipStreamIfEosr();
+  return streams_[current_idx_]->ReadBytes(length, buf, status, peek);
+}
+
+bool ScannerContext::ConcatenatedStreams::GetNextStream() {
+  if (current_idx_ >= (streams_.size() - 1)) return false;
+  ++current_idx_;
+  return true;
+}
+
+void ScannerContext::ConcatenatedStreams::SkipStreamIfEosr() {
+  DCHECK_GE(current_idx_, 0);
+  DCHECK_LT(current_idx_, streams_.size());
+  while (streams_[current_idx_]->eosr()) {
+    if (!GetNextStream()) break;
+  }
+}
