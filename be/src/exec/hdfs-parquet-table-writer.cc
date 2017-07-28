@@ -648,16 +648,14 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
     if (page.header.data_page_header.num_values == 0) {
       // Skip empty pages
       location.offset = -1;
-      location.compressed_page_size = -1;
+      location.total_page_size = -1;
       location.first_row_index = -1;
       page_locations_[i] = location;
       continue;
     }
 
     location.offset = *file_pos;
-    location.compressed_page_size = page.header.compressed_page_size;
     location.first_row_index = current_row_group_index;
-    page_locations_[i] = location;
 
     // Write data page header
     uint8_t* buffer = nullptr;
@@ -666,6 +664,9 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
         parent_->thrift_serializer_->Serialize(&page.header, &len, &buffer));
     RETURN_IF_ERROR(parent_->Write(buffer, len));
     *file_pos += len;
+
+    location.total_page_size = page.header.compressed_page_size + len;
+    page_locations_[i] = location;
 
     // Write the page data
     RETURN_IF_ERROR(parent_->Write(page.data, page.header.compressed_page_size));

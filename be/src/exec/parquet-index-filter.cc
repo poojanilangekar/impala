@@ -32,7 +32,7 @@ using namespace impala;
 namespace impala {
 
 Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
-    vector<FilteredPageInfos>& valid_pages,
+    vector<FilteredPageInfos>& valid_pages, vector<RowRange>& valid_ranges,
     vector<ScannerContext::Stream*>& column_idx_streams,
     ScannerContext::Stream* offset_idx_stream) {
   *skip_pages = false;
@@ -144,7 +144,6 @@ Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
     }
   }
 
-  vector<RowRange> filtered_ranges;
   if (skip_ranges.size()) {
     // Sort the skip ranges in order to consolidate the valid rows.
     std::sort(skip_ranges.begin(), skip_ranges.end(), std::less<RowRange>());
@@ -162,7 +161,7 @@ Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
         // Modify the skip end if the new skip ends after the previous skip.
         if (skip_end < row_range.second) skip_end = row_range.second;
       } else {
-        filtered_ranges.push_back(std::make_pair(skip_end + 1, row_range.first - 1));
+        valid_ranges.push_back(std::make_pair(skip_end + 1, row_range.first - 1));
         skip_end = row_range.second;
       }
     }
@@ -170,22 +169,21 @@ Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
     // If the last skip ended before the end of the row_group, add the remaining rows to
     // the valid range.
     if (skip_end < row_group_.num_rows - 1) {
-      filtered_ranges.push_back(std::make_pair(skip_end + 1, row_group_.num_rows - 1));
+      valid_ranges.push_back(std::make_pair(skip_end + 1, row_group_.num_rows - 1));
     }
 
-    *skip_pages = true;
   } else {
     // None of the rows can be skipped. Scan entire RowGroup.
     return Status::OK();
   }
 
-  if (filtered_ranges.size()) {
+  if (valid_ranges.size()) {
     valid_pages.resize(row_group_.columns.size());
     // For each column in the row group, determine the set of valid pages to be read.
     for (int col_idx = 0; col_idx < row_group_.columns.size(); ++col_idx) {
       parquet::OffsetIndex offset_index = row_group_offset_index_.offset_indexes[col_idx];
       vector<parquet::PageLocation> page_locations = offset_index.page_locations;
-      vector<RowRange>::iterator it = filtered_ranges.begin();
+      vector<RowRange>::iterator it = valid_ranges.begin();
 
       for (int page_idx = 0; page_idx < page_locations.size(); ++page_idx) {
         int64_t first_row_index = page_locations[page_idx].first_row_index;
@@ -197,11 +195,11 @@ Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
           last_row_index = page_locations[page_idx + 1].first_row_index - 1;
 
         FilteredPageInfo page{.page_id = page_idx,
-            .compressed_page_size = page_locations[page_idx].compressed_page_size,
+            .total_page_size = page_locations[page_idx].total_page_size,
             .offset = page_locations[page_idx].offset,
             .first_row_index = first_row_index};
-
-        while (it != filtered_ranges.end()) {
+        vector<RowRange> ranges;
+        while (it != valid_ranges.end()) {
           int64_t start_offset = -1;
           int64_t end_offset = -1;
           // Set the start offset within the page if a part/whole of the range lies
@@ -219,18 +217,21 @@ Status ParquetIndexFilter::EvaluateIndexConjuncts(bool* skip_pages,
 
           // For valid ranges, add a range within the page.
           if (start_offset != -1) {
-            page.ranges.push_back(std::make_pair(start_offset, end_offset));
+            ranges.push_back(std::make_pair(start_offset, end_offset));
           }
           // If the current page extends beyond the current range, check the next range.
-          if (last_row_index > it->second) ++it;
+          if (last_row_index >= it->second) ++it;
           else break;
         }
         // Add the current page to the set of valid pages if it contains atleast one valid
         // range which needs to be scanned.
-        if (page.ranges.size()) valid_pages[col_idx].push_back(page);
-        if (it == filtered_ranges.end()) break;
+        if (ranges.size()) {
+          valid_pages[col_idx].push_back(page);
+        }
+        if (it == valid_ranges.end()) break;
       }
     }
+    *skip_pages = true;
   }
   return Status::OK();
 }

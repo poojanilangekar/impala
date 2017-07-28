@@ -604,8 +604,8 @@ struct PageLocation {
 /** Offset of the page in the file **/
   1: required i64 offset
 
-/** Size of the page, including header. The same as PageHeader.compressed_page_size **/
-  2: required i32 compressed_page_size
+/** Size of the page, including header. Sum of compressed_page_size and header length **/
+  2: required i32 total_page_size
 
 /** Index within the RowGroup of the first row of the page **/
   3: required i64 first_row_index

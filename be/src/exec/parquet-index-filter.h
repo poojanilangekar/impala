@@ -41,10 +41,9 @@ typedef std::pair<int64_t, int64_t> RowRange;
 /// Structure of pages to indicate the set of rows to be read by PqrquetColumnReader.
 struct FilteredPageInfo {
   int page_id;
-  int32_t compressed_page_size;
+  int32_t total_page_size;
   int64_t offset;
   int64_t first_row_index;
-  vector<RowRange> ranges;
 };
 
 typedef vector<FilteredPageInfo> FilteredPageInfos;
@@ -79,7 +78,7 @@ class ParquetIndexFilter {
   /// the valid_pages are populated for each column to be processed by the
   /// HdfsParquetScanner and passed on to the ParquetColumnReader.
   Status EvaluateIndexConjuncts(bool* skip_pages, vector<FilteredPageInfos>& valid_pages,
-      vector<ScannerContext::Stream*>& column_idx_streams,
+      vector<RowRange>& valid_ranges, vector<ScannerContext::Stream*>& column_idx_streams,
       ScannerContext::Stream* offset_idx_stream);
 
  private:

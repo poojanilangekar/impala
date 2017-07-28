@@ -479,7 +479,12 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
     return Status::OK();
   }
   assemble_rows_timer_.Start();
-  Status status = AssembleRows(column_readers_, row_batch, &advance_row_group_);
+  Status status;
+  if (row_ranges_.size() > 0) {
+    status = AssembleFilteredRows(
+        column_readers_, row_batch, &advance_row_group_, row_ranges_);
+  } else
+    status = AssembleRows(column_readers_, row_batch, &advance_row_group_);
   assemble_rows_timer_.Stop();
   RETURN_IF_ERROR(status);
   if (!parse_status_.ok()) {
@@ -490,8 +495,8 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
   return Status::OK();
 }
 
-Status HdfsParquetScanner::EvaluateParquetIndex(const parquet::RowGroup& row_group,
-    bool* skip_pages, vector<FilteredPageInfos>& valid_pages) {
+Status HdfsParquetScanner::EvaluateParquetIndex(
+    const parquet::RowGroup& row_group, bool* skip_pages) {
   *skip_pages = false;
   ScannerContext::Stream* offset_idx_stream = nullptr;
   std::vector<ScannerContext::Stream*> column_idx_streams(0);
@@ -538,11 +543,14 @@ Status HdfsParquetScanner::EvaluateParquetIndex(const parquet::RowGroup& row_gro
           scan_node_->reader_context(), col_idx_range, true));
     }
     Tuple* min_max_tuple = reinterpret_cast<Tuple*>(min_max_tuple_buffer_.buffer());
-
+    valid_pages_.resize(0);
+    row_ranges_.resize(0);
+    current_range_idx_ = -1;
+    next_range_idx_ = 0;
     ParquetIndexFilter index_filter(row_group, file_metadata_.column_orders, scan_node_,
         min_max_tuple, min_max_conjunct_evals_, schema_resolver_.get());
     RETURN_IF_ERROR(index_filter.EvaluateIndexConjuncts(
-        skip_pages, valid_pages, column_idx_streams, offset_idx_stream));
+        skip_pages, valid_pages_, row_ranges_, column_idx_streams, offset_idx_stream));
   }
   return Status::OK();
 }
@@ -691,16 +699,15 @@ Status HdfsParquetScanner::NextRowGroup() {
       continue;
     }
 
-    bool skip_pages_on_index;
-    vector<FilteredPageInfos> valid_pages;
-    EvaluateParquetIndex(row_group, &skip_pages_on_index, valid_pages);
+    bool skip_pages;
+    EvaluateParquetIndex(row_group, &skip_pages);
 
     // Prepare dictionary filtering columns for first read
     // This must be done before dictionary filtering, because this code initializes
     // the column offsets and streams needed to read the dictionaries.
     // TODO: Restructure the code so that the dictionary can be read without the rest
     // of the column.
-    RETURN_IF_ERROR(InitColumns(row_group_idx_, dict_filterable_readers_));
+    RETURN_IF_ERROR(InitColumns(row_group_idx_, dict_filterable_readers_, skip_pages));
 
     // If there is a dictionary-encoded column where every value is eliminated
     // by a conjunct, the row group can be eliminated. This initializes dictionaries
@@ -720,7 +727,8 @@ Status HdfsParquetScanner::NextRowGroup() {
     // At this point, the row group has passed any filtering criteria
     // Prepare non-dictionary filtering column readers for first read and
     // initialize their dictionaries.
-    RETURN_IF_ERROR(InitColumns(row_group_idx_, non_dict_filterable_readers_));
+    RETURN_IF_ERROR(
+        InitColumns(row_group_idx_, non_dict_filterable_readers_, skip_pages));
     status = InitDictionaries(non_dict_filterable_readers_);
     if (!status.ok()) {
       // Either return an error or skip this row group if it is ok to ignore errors
@@ -1033,6 +1041,131 @@ Status HdfsParquetScanner::AssembleRows(
     if (row_batch->AtCapacity()) return Status::OK();
   }
 
+  return Status::OK();
+}
+
+Status HdfsParquetScanner::AssembleFilteredRows(
+    const std::vector<ParquetColumnReader*>& column_readers, RowBatch* row_batch,
+    bool* skip_row_group, const std::vector<RowRange>& row_ranges) {
+  DCHECK(!column_readers.empty());
+  DCHECK(row_batch != NULL);
+  DCHECK_EQ(*skip_row_group, false);
+  DCHECK_GT(row_ranges.size(), 0);
+  DCHECK(scratch_batch_ != NULL);
+
+  bool continue_execution = true;
+
+  while (next_range_idx_ < row_ranges.size()) {
+    RowRange row_range;
+    int64_t current_row;
+    int64_t read_upto_row;
+
+    if (current_range_idx_ < next_range_idx_) {
+      current_range_idx_++;
+      row_range = row_ranges[current_range_idx_];
+      int64_t skip_to_row = row_range.first + 1;
+      read_upto_row = row_range.second + 1;
+
+      if (column_readers[0]->RowGroupAtEnd()) {
+        Status err(Substitute("Corrupt Parquet file '$0' :  Column hit row group end"
+                              "while expecting values for range [$1,$2]",
+            filename(), row_range.first, row_range.second));
+        parse_status_.MergeStatus(err);
+        return Status::OK();
+      }
+      // Validate that all ColumnReaders have not processed any value in the current
+      // RowRange. Advance each ColumnReader to point to the first value in the row_range.
+      if(skip_to_row > 1) {
+      for (ParquetColumnReader* c : column_readers) {
+        DCHECK_LE(c->NextValueToRead(), skip_to_row);
+        int64_t skipped_to_row = 0;
+        int64_t num_remaining_in_page = 0;
+        continue_execution =
+            c->SkipToValue(skip_to_row, &skipped_to_row, &num_remaining_in_page);
+        DCHECK(!continue_execution || num_remaining_in_page > 0);
+        bool num_tuples_mismatch = skipped_to_row < skip_to_row;
+
+        if (UNLIKELY(!continue_execution || num_tuples_mismatch)) {
+          FlushRowGroupResources(row_batch);
+          scratch_batch_->num_tuples = 0;
+          DCHECK(scratch_batch_->AtEnd());
+          *skip_row_group = true;
+          if (num_tuples_mismatch && continue_execution) {
+            parse_status_.MergeStatus(Status(
+                Substitute("Corrupt Parquet file '$0': "
+                           "column '$1' had $2 remaining values but expected $3 more",
+                    filename(), c->schema_element().name, num_remaining_in_page,
+                    skip_to_row - skipped_to_row)));
+          }
+          return Status::OK();
+        }
+        DCHECK_EQ(c->NextValueToRead(), skip_to_row);
+      }
+      }
+      current_row = skip_to_row;
+    } else {
+      row_range = row_ranges[current_range_idx_];
+      current_row = column_readers[0]->NextValueToRead();
+      read_upto_row = row_range.second + 1;
+    }
+    int64_t scratch_capacity = scratch_batch_->capacity;
+    // Rows to be read in range. Range is inclusive on both ends. Hence add 1.
+    int64_t rows_in_range = read_upto_row - current_row;
+    int64_t num_rows_to_read = min(scratch_capacity, rows_in_range);
+    while (num_rows_to_read > 0) {
+      RETURN_IF_ERROR(scratch_batch_->Reset(state_));
+      InitTupleBuffer(
+          template_tuple_, scratch_batch_->tuple_mem, scratch_batch_->capacity);
+
+      // Materialize the top-level slots into the scratch batch column-by-column.
+      int last_num_tuples = -1;
+      int num_col_readers = column_readers.size();
+      continue_execution = true;
+
+      for (int c = 0; c < num_col_readers; ++c) {
+        ParquetColumnReader* col_reader = column_readers[c];
+        if (col_reader->max_rep_level() > 0) {
+          continue_execution = col_reader->ReadValueBatch(&scratch_batch_->aux_mem_pool,
+              num_rows_to_read, tuple_byte_size_, scratch_batch_->tuple_mem,
+              &scratch_batch_->num_tuples);
+        } else {
+          continue_execution = col_reader->ReadNonRepeatedValueBatch(
+              &scratch_batch_->aux_mem_pool, num_rows_to_read, tuple_byte_size_,
+              scratch_batch_->tuple_mem, &scratch_batch_->num_tuples);
+        }
+        // Check all column readers read the same number of values.
+        bool num_tuples_mismatch =
+            c != 0 && last_num_tuples != scratch_batch_->num_tuples;
+        if (UNLIKELY(!continue_execution || num_tuples_mismatch)) {
+          // Skipping this row group. Free up all resources.
+          if (num_tuples_mismatch && continue_execution) {
+            Status err(Substitute("Corrupt Parquet file '$0': column '$1' "
+                                  "has $2 remaining values but expected $3",
+                filename(), col_reader->schema_element().name, last_num_tuples,
+                scratch_batch_->num_tuples));
+            parse_status_.MergeStatus(err);
+          }
+          FlushRowGroupResources(row_batch);
+          scratch_batch_->num_tuples = 0;
+          DCHECK(scratch_batch_->AtEnd());
+          *skip_row_group = true;
+          return Status::OK();
+        }
+        last_num_tuples = scratch_batch_->num_tuples;
+      }
+      row_group_rows_read_ += scratch_batch_->num_tuples;
+      rows_in_range -= scratch_batch_->num_tuples;
+      int num_rows_to_commit = TransferScratchTuples(row_batch);
+      RETURN_IF_ERROR(CommitRows(row_batch, num_rows_to_commit));
+      if (row_batch->AtCapacity()) return Status::OK();
+      num_rows_to_read = min(scratch_capacity, rows_in_range);
+    }
+    LOG(INFO) << "Num rows to read " << num_rows_to_read;
+    next_range_idx_++;
+  }
+  // Since all the valid row ranges have been scanned, the rest of the row group can be
+  // skipped.
+  *skip_row_group = true;
   return Status::OK();
 }
 
@@ -1606,8 +1739,8 @@ Status HdfsParquetScanner::CreateCountingReader(const SchemaPath& parent_path,
   return Status::OK();
 }
 
-Status HdfsParquetScanner::InitColumns(
-    int row_group_idx, const vector<ParquetColumnReader*>& column_readers) {
+Status HdfsParquetScanner::InitColumns(int row_group_idx,
+    const vector<ParquetColumnReader*>& column_readers, bool skip_pages) {
   const HdfsFileDesc* file_desc = scan_node_->GetFileDesc(filename());
   DCHECK(file_desc != NULL);
   parquet::RowGroup& row_group = file_metadata_.row_groups[row_group_idx];
@@ -1625,8 +1758,9 @@ Status HdfsParquetScanner::InitColumns(
       CollectionColumnReader* collection_reader =
           static_cast<CollectionColumnReader*>(col_reader);
       collection_reader->Reset();
-      // Recursively init child readers
-      RETURN_IF_ERROR(InitColumns(row_group_idx, *collection_reader->children()));
+      // Recursively init child readers. Page skipping is currently not supported for
+      // collection readers.
+      RETURN_IF_ERROR(InitColumns(row_group_idx, *collection_reader->children(), false));
       continue;
     }
     ++num_scalar_readers;
@@ -1634,7 +1768,6 @@ Status HdfsParquetScanner::InitColumns(
     BaseScalarColumnReader* scalar_reader =
         static_cast<BaseScalarColumnReader*>(col_reader);
     const parquet::ColumnChunk& col_chunk = row_group.columns[scalar_reader->col_idx()];
-    int64_t col_start = col_chunk.meta_data.data_page_offset;
 
     if (num_values == -1) {
       num_values = col_chunk.meta_data.num_values;
@@ -1649,17 +1782,47 @@ Status HdfsParquetScanner::InitColumns(
         row_group_idx, scalar_reader->col_idx(), scalar_reader->schema_element(),
         scalar_reader->slot_desc_, state_));
 
+    const DiskIoMgr::ScanRange* split_range =
+        static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
+    int64_t col_start = col_chunk.meta_data.data_page_offset;
+    int64_t col_len = col_chunk.meta_data.total_compressed_size;
+    int64_t col_end;
+    vector<ScannerContext::Stream*> streams;
+
+    // If the column chunk contains dictionary pages, allocate a stream for dictionary
+    // pages and add it to the streams vector.
     if (col_chunk.meta_data.__isset.dictionary_page_offset) {
-      // Already validated in ValidateColumnOffsets()
       DCHECK_LT(col_chunk.meta_data.dictionary_page_offset, col_start);
       col_start = col_chunk.meta_data.dictionary_page_offset;
+      col_len = col_chunk.meta_data.data_page_offset - col_start;
+      if (col_len <= 0) {
+        return Status(Substitute(
+            "File '$0' contains invalid dictionary size: $1", filename(), col_len));
+      }
+      col_end = col_start + col_len;
+      DCHECK(col_end > 0 && col_end < file_desc->file_length);
+      // Determine if the dictionary is completely contained within a local split.
+      bool col_range_local = split_range->expected_local()
+          && col_start >= split_range->offset()
+          && col_end <= split_range->offset() + split_range->len();
+
+      DiskIoMgr::ScanRange* dict_range = scan_node_->AllocateScanRange(
+          metadata_range_->fs(), filename(), col_len, col_start, scalar_reader->col_idx(),
+          split_range->disk_id(), col_range_local,
+          DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+      col_ranges.push_back(dict_range);
+      ScannerContext::Stream* stream = context_->AddStream(dict_range);
+      DCHECK(stream != NULL);
+      streams.push_back(stream);
+      // Re-assign the col_start and col_len values for the data pages.
+      col_start = col_chunk.meta_data.data_page_offset;
+      col_len = col_chunk.meta_data.total_compressed_size - col_len;
     }
-    int64_t col_len = col_chunk.meta_data.total_compressed_size;
     if (col_len <= 0) {
       return Status(Substitute("File '$0' contains invalid column chunk size: $1",
           filename(), col_len));
     }
-    int64_t col_end = col_start + col_len;
+    col_end = col_start + col_len;
 
     // Already validated in ValidateColumnOffsets()
     DCHECK(col_end > 0 && col_end < file_desc->file_length);
@@ -1678,40 +1841,73 @@ Status HdfsParquetScanner::InitColumns(
       return Status(Substitute("Expected parquet column file path '$0' to match "
           "filename '$1'", col_chunk.file_path, filename()));
     }
+    if (skip_pages && (valid_pages_.size() > 0)) {
+      FilteredPageInfos page_infos = valid_pages_[scalar_reader->col_idx()];
 
-    const DiskIoMgr::ScanRange* split_range =
-        static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
+      for (FilteredPageInfo page_info : page_infos) {
+        int64_t page_start = page_info.offset;
+        int64_t page_len = page_info.total_page_size;
+        DCHECK(page_len > 0);
+        int64_t page_end = page_start + page_len;
+        DCHECK(page_end > 0 && page_end < file_desc->file_length);
 
-    // Determine if the column is completely contained within a local split.
-    bool col_range_local = split_range->expected_local()
-        && col_start >= split_range->offset()
-        && col_end <= split_range->offset() + split_range->len();
-    DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
-        filename(), col_len, col_start, scalar_reader->col_idx(), split_range->disk_id(),
-        col_range_local,
-        DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
-    col_ranges.push_back(col_range);
+        // Determine if the page is completely contained in the local split.
+        bool page_range_local = split_range->expected_local()
+            && page_start >= split_range->offset()
+            && page_end <= split_range->offset() + split_range->len();
+        DiskIoMgr::ScanRange* page_range = scan_node_->AllocateScanRange(
+            metadata_range_->fs(), filename(), page_len, page_start,
+            scalar_reader->col_idx(), split_range->disk_id(), page_range_local,
+            DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+        col_ranges.push_back(page_range);
+        // Get the stream that will be used for this column
+        ScannerContext::Stream* stream = context_->AddStream(page_range);
+        DCHECK(stream != NULL);
+        streams.push_back(stream);
+      }
+      ScannerContext::ConcatenatedStreams* concatenated_streams =
+          new ScannerContext::ConcatenatedStreams(streams);
+      obj_pool_.Add(concatenated_streams);
+      RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, concatenated_streams,
+          &valid_pages_[scalar_reader->col_idx()]));
 
-    // Get the stream that will be used for this column
-    vector<ScannerContext::Stream*> streams;
-    ScannerContext::Stream* stream = context_->AddStream(col_range);
-    DCHECK(stream != NULL);
-    streams.push_back(stream);
-    ScannerContext::ConcatenatedStreams* concatenated_streams =
-        new ScannerContext::ConcatenatedStreams(streams);
-    obj_pool_.Add(concatenated_streams);
-    RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, concatenated_streams));
-
-    const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
-    if (slot_desc == NULL || !slot_desc->type().IsStringType() ||
-        col_chunk.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
-      // Non-string types are always compact.  Compressed columns don't reference data in
-      // the io buffers after tuple materialization.  In both cases, we can set compact to
-      // true and recycle buffers more promptly.
-      stream->set_contains_tuple_data(false);
+      const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
+      if (slot_desc == NULL || !slot_desc->type().IsStringType()
+          || col_chunk.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
+        for (ScannerContext::Stream* stream : streams) {
+          stream->set_contains_tuple_data(false);
+        }
+      }
+    } else {
+      // Determine if the column is completely contained within a local split.
+      bool col_range_local = split_range->expected_local()
+          && col_start >= split_range->offset()
+          && col_end <= split_range->offset() + split_range->len();
+      DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(
+          metadata_range_->fs(), filename(), col_len, col_start, scalar_reader->col_idx(),
+          split_range->disk_id(), col_range_local,
+          DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+      col_ranges.push_back(col_range);
+      // Get the stream that will be used for this column
+      ScannerContext::Stream* stream = context_->AddStream(col_range);
+      DCHECK(stream != NULL);
+      streams.push_back(stream);
+      ScannerContext::ConcatenatedStreams* concatenated_streams =
+          new ScannerContext::ConcatenatedStreams(streams);
+      obj_pool_.Add(concatenated_streams);
+      RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, concatenated_streams));
+      const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
+      if (slot_desc == NULL || !slot_desc->type().IsStringType()
+          || col_chunk.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
+        for (ScannerContext::Stream* stream : streams) {
+          // Non-string types are always compact.  Compressed columns don't reference data
+          // in the io buffers after tuple materialization.  In both cases, we can set
+          // compact to true and recycle buffers more promptly.
+          stream->set_contains_tuple_data(false);
+        }
+      }
     }
   }
-  DCHECK_EQ(col_ranges.size(), num_scalar_readers);
 
   // Issue all the column chunks to the io mgr and have them scheduled immediately.
   // This means these ranges aren't returned via DiskIoMgr::GetNextRange and
@@ -1749,9 +1945,9 @@ Status HdfsParquetScanner::ValidateEndOfRowGroup(
   if (column_readers[0]->max_rep_level() == 0) {
     // These column readers materialize table-level values (vs. collection values). Test
     // if the expected number of rows from the file metadata matches the actual number of
-    // rows read from the file.
+    // rows read from the file if none of the pages are to be skipped.
     int64_t expected_rows_in_group = file_metadata_.row_groups[row_group_idx].num_rows;
-    if (rows_read != expected_rows_in_group) {
+    if ((rows_read != expected_rows_in_group) && (valid_pages_.size() == 0)) {
       return Status(TErrorCode::PARQUET_GROUP_ROW_COUNT_ERROR, filename(), row_group_idx,
           expected_rows_in_group, rows_read);
     }

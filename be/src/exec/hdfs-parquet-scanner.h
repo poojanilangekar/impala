@@ -477,6 +477,19 @@ class HdfsParquetScanner : public HdfsScanner {
   /// The codegen'd version of ProcessScratchBatch() if available, NULL otherwise.
   ProcessScratchBatchFn codegend_process_scratch_batch_fn_;
 
+  /// Stores the filtered row ranges to be scanned in the current row group.
+  vector<RowRange> row_ranges_;
+
+  /// Keeps track of the current row range being scanned.
+  int current_range_idx_;
+
+  /// Keeps track of the next row range to be scanned. Used to avoid advancing a row range
+  /// unless the previous row range is completed.
+  int next_range_idx_;
+
+  /// Stores the FilteredPageInfos for each column in the current row group.
+  vector<FilteredPageInfos> valid_pages_;
+
   const char* filename() const { return metadata_range_->file(); }
 
   virtual Status GetNextInternal(RowBatch* row_batch);
@@ -490,10 +503,9 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Initializes a ParquetIndexFilter and evaluates the min/max conjuncts on the indexes
   /// of the columns if present. If one or more pages could be skipped, sets 'skip_pages'
-  /// to true and populates the 'valid_pages' for each column  in the RowGroup, otherwise
+  /// to true and populates the valid_pages_ for each column  in the RowGroup, otherwise
   /// sets 'skip_pages' to false.
-  Status EvaluateParquetIndex(const parquet::RowGroup& row_group, bool* skip_pages,
-      vector<FilteredPageInfos>& valid_pages);
+  Status EvaluateParquetIndex(const parquet::RowGroup& row_group, bool* skip_pages);
 
   /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
   /// row batches. Will update 'filter_stats_'.
@@ -513,6 +525,17 @@ class HdfsParquetScanner : public HdfsScanner {
   /// e.g., due to a parse error, but execution should continue.
   Status AssembleRows(const std::vector<ParquetColumnReader*>& column_readers,
       RowBatch* row_batch, bool* skip_row_group);
+
+  /// Reads data from the 'column_readers' from the valid 'row_ranges' to materialize
+  /// tuples into 'row_batch'. It ensures that each column reader skips to the start
+  /// of a row_range before reading values. It always reads only uptill the end of a
+  /// row_range, skipping rows in a page if necessary. If a non-recoverable error was
+  /// encountered, it retuns a Non-Ok status to terminate immidately.
+  /// It sets *skip_row_group to indicate that all the valid row ranges in the current
+  /// row_group have been read or due to a parse error wherein the execution should
+  /// continue.
+  Status AssembleFilteredRows(const std::vector<ParquetColumnReader*>& column_readers,
+      RowBatch* row_batch, bool* skip_row_group, const std::vector<RowRange>& row_ranges);
 
   /// Commit num_rows to the given row batch.
   /// Returns OK if the query is not cancelled and hasn't exceeded any mem limits.
@@ -611,8 +634,8 @@ class HdfsParquetScanner : public HdfsScanner {
   /// initializes 'column_readers' and issues the reads for the columns. 'column_readers'
   /// should be the readers used to materialize a single tuple (i.e., column_readers_ or
   /// the children of a collection node).
-  Status InitColumns(
-      int row_group_idx, const std::vector<ParquetColumnReader*>& column_readers);
+  Status InitColumns(int row_group_idx,
+      const std::vector<ParquetColumnReader*>& column_readers, bool skip_pages);
 
   /// Initialize dictionaries for all column readers
   Status InitDictionaries(const std::vector<ParquetColumnReader*>& column_readers);
